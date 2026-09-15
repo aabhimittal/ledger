@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dev]"
+      # Privileged-backend tests (overlayfs) self-skip when the runner cannot
+      # mount; the Firecracker tests run everywhere because they exercise the
+      # API protocol against a fake socket, not a hypervisor.
+      - run: pytest -q --durations=5
+      - name: end-to-end crash / resume / fork walkthrough
+        run: python examples/demo_agent.py demo --root "${RUNNER_TEMP}/ledger-demo"
+
+  cost-model:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      # Small n keeps CI quick; the point is that the benchmark still runs and
+      # its recommendation stays finite, not that these numbers are canonical.
+      - run: python -m ledger.bench --steps 60 --files 20 --k 5 10 20 --json

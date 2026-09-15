@@ -259,12 +259,14 @@ class OverlayFSSnapshotter:
         # Syncing the merged mount pushes dirty pages into upperdir first.
         subprocess.run(["sync", "-f", str(self.merged)], check=False, capture_output=True)
         delta: list[dict] = []
-        for dirpath, _dirnames, filenames in os.walk(self.upper):
+        for dirpath, dirnames, filenames in os.walk(self.upper):
+            dirnames.sort()  # deterministic manifests
             here = Path(dirpath)
             rel_dir = here.relative_to(self.upper).as_posix()
             if rel_dir != ".":
                 delta.append({"kind": "dir", "path": rel_dir,
-                              "mode": stat.S_IMODE(here.stat().st_mode)})
+                              "mode": stat.S_IMODE(here.stat().st_mode),
+                              "xattrs": _read_overlay_xattrs(here)})
             for name in sorted(filenames):
                 p = here / name
                 rel = p.relative_to(self.upper).as_posix()
@@ -276,9 +278,11 @@ class OverlayFSSnapshotter:
                 elif stat.S_ISREG(st.st_mode):
                     digest, size = cas.put_file(p)
                     delta.append({"kind": "file", "path": rel, "digest": digest,
-                                  "size": size, "mode": stat.S_IMODE(st.st_mode)})
+                                  "size": size, "mode": stat.S_IMODE(st.st_mode),
+                                  "xattrs": _read_overlay_xattrs(p)})
         return {"backend": self.backend, "lower": str(self.lower), "upper": str(self.upper),
-                "merged": str(self.merged), "delta": delta}
+                "merged": str(self.merged), "delta": delta,
+                "bytes": sum(d.get("size", 0) for d in delta)}
 
     def restore(self, manifest: dict, cas: CAS) -> None:
         self.unmount()
@@ -290,8 +294,10 @@ class OverlayFSSnapshotter:
             if kind == "dir":
                 target.mkdir(parents=True, exist_ok=True)
                 os.chmod(target, item.get("mode", 0o755))
+                _write_overlay_xattrs(target, item.get("xattrs", {}))
             elif kind == "file":
                 cas.materialize(item["digest"], target, item.get("mode", 0o644))
+                _write_overlay_xattrs(target, item.get("xattrs", {}))
             elif kind == "symlink":
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.symlink(item["target"], target)
@@ -299,6 +305,40 @@ class OverlayFSSnapshotter:
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.mknod(target, 0o600 | stat.S_IFCHR, os.makedev(0, 0))
         self.mount()
+
+
+OVERLAY_XATTR_PREFIX = "trusted.overlay."
+
+
+def _read_overlay_xattrs(path: Path) -> dict[str, str]:
+    """Capture overlayfs' own xattrs, hex-encoded for the manifest.
+
+    ``trusted.overlay.opaque`` is how overlayfs records "this directory was
+    deleted and recreated, do not merge the lower one in". Without it a restored
+    delta silently resurrects files the agent deleted, which is exactly the kind
+    of quiet wrongness a snapshot must not have. Reading and writing
+    ``trusted.*`` needs CAP_SYS_ADMIN, which this backend already requires.
+    """
+    out: dict[str, str] = {}
+    try:
+        names = os.listxattr(path, follow_symlinks=False)
+    except OSError:
+        return out
+    for name in names:
+        if name.startswith(OVERLAY_XATTR_PREFIX):
+            try:
+                out[name] = os.getxattr(path, name, follow_symlinks=False).hex()
+            except OSError:
+                pass
+    return out
+
+
+def _write_overlay_xattrs(path: Path, xattrs: dict[str, str]) -> None:
+    for name, value in (xattrs or {}).items():
+        try:
+            os.setxattr(path, name, bytes.fromhex(value), follow_symlinks=False)
+        except OSError as e:
+            raise SnapshotError(f"cannot restore {name} on {path}: {e}") from None
 
 
 class _UnixHTTPConnection(http.client.HTTPConnection):

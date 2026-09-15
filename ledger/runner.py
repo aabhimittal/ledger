@@ -192,6 +192,12 @@ class Recorder:
         self.replayed_samples = 0
         self.model_calls = 0
         self.divergences = 0
+        self.replayed_effects = 0
+        self.effect_replay_seconds = 0.0
+        """How much of this recovery went into re-executing internal effects.
+
+        The only part of replay that a shorter snapshot interval can reduce, so
+        it is the number the cadence model needs (see ledger.cost)."""
         self.flip_reason: str | None = None
         self._snapshot_requested = False
         self._replaying_step = False
@@ -393,10 +399,14 @@ class Recorder:
             # present, and re-running would double-apply it.
             failure: Exception | None = None
             value: Any = None
+            t0 = time.perf_counter()
             try:
                 value = self._invoke(spec, args, crec.payload.get("idempotency_key"))
             except Exception as e:  # noqa: BLE001 - re-raised below
                 failure = e
+            finally:
+                self.effect_replay_seconds += time.perf_counter() - t0
+                self.replayed_effects += 1
             observed = _result_hash(failure is None, value,
                                     None if failure is None else type(failure).__name__)
             if observed != rrec.payload.get("result_hash"):
@@ -607,6 +617,8 @@ class RunOutcome:
     mode: str = Mode.LIVE.value
     replayed_steps: int = 0
     replayed_samples: int = 0
+    replayed_effects: int = 0
+    effect_replay_seconds: float = 0.0
     model_calls: int = 0
     divergences: int = 0
     snapshots: int = 0
@@ -881,6 +893,8 @@ class AgentRunner:
         return RunOutcome(
             run_id=run_id, status=status, result=result, steps=step, mode=mode.value,
             replayed_steps=rec.replayed_steps, replayed_samples=rec.replayed_samples,
+            replayed_effects=rec.replayed_effects,
+            effect_replay_seconds=round(rec.effect_replay_seconds, 6),
             model_calls=rec.model_calls, divergences=rec.divergences, snapshots=snapshots,
             parent_run_id=meta.parent_run_id, forked_at_step=meta.forked_at_step,
             error=error, workspace=str(workspace),
