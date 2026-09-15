@@ -169,6 +169,61 @@ file-level checkpointer: it survives a crash in the middle of a `pip install`,
 because it restores the process tree and not just the filesystem. It is also the
 most expensive, which is the honest trade.
 
+How far each is actually verified, since "it has tests" means different things
+here:
+
+- `DirSnapshotter` — exercised end to end by most of the suite.
+- `OverlayFSSnapshotter` — real mounts in `tests/test_overlayfs.py`, covering
+  copy-up, whiteouts as char devices, symlinks, and `trusted.overlay.opaque`
+  round-tripping. Those tests found two real bugs: deletions were not surviving
+  a restore (opaque xattrs were dropped, so the lower directory silently
+  re-merged) and `clear_dir` crashed with ENXIO trying to `rmtree` a whiteout
+  device. They skip where the kernel or privileges will not allow a mount, so a
+  green CI run on a hosted runner has *not* tested this backend.
+- `FirecrackerSnapshotter` — `tests/test_firecracker.py` drives it against a
+  fake API socket: route order, request bodies, CAS round-trip of the state and
+  memory files, scratch cleanup, and that a failed create still resumes the VM.
+  That is the protocol, which is the part most likely to be wrong. It is not
+  proof that a real Firecracker accepts those bodies, and should not be read as
+  such.
+
+## What it costs
+
+`ledger.cost` models this and `python -m ledger.bench` measures it. One
+calibration, on one machine (200 steps, 40 churned files, a 20 MiB seeded
+workspace, ~2 KB prompts, `DirSnapshotter`) — illustrative, not a default:
+
+| quantity | measured | notes |
+|---|---|---|
+| log volume, default | ~2.6 KB/step | prompt hash + tail; ~13 MiB at 5k steps |
+| log volume, `store_prompts=True` | ~4.4 KB/step | 1.7× at this prompt length; ~21 MiB at 5k steps |
+| `C_s` snapshot capture | ~20 ms | 20 MiB workspace; 41 snapshots deduped to 560 KiB of CAS |
+| `C_e` effect re-execution | ~0.02 ms/step | one 80-byte file append |
+| in-memory replay floor | ~4 ms/step | 170 steps replayed in 0.72 s |
+
+Two conclusions, and the second is uncomfortable:
+
+**Prompts dominate the log, but not catastrophically.** Storing full prompt text
+costs 1.7× here and grows with prompt length. A 20k-step run is tens of
+megabytes either way, so log size is not what will stop you — which is why the
+default keeps a hash plus a tail rather than doing anything cleverer.
+
+**Recovery time is dominated by the one cost `k` cannot reduce.** The in-memory
+replay floor was ~200× `C_e` per step in this calibration. For a workload whose
+internal effects are this cheap to redo, periodic snapshots buy almost nothing:
+`k*` comes out at "just the baseline and the terminal snapshot", and the naive
+model — the one that feeds *total* per-step replay time into the formula —
+recommends about twenty times more snapshots than are worth taking. Snapshots
+earn their keep when internal effects are expensive (a build, an install, a
+database write), not merely when a run is long.
+
+With one important exception, which the cost model deliberately does not cover:
+if a tool's internal effects are **not** reliably reproducible, `k` stops being a
+performance parameter and becomes a correctness one. Replay re-executes every
+internal effect above the snapshot line, so `k` bounds how much
+irreproducibility a recovery is exposed to. Where that is a worry, pick `k`
+small and ignore the optimum.
+
 ## Attribution is monotone, not step-local
 
 `resample_probe(run, k)` forks at `k-1` and lets the agent re-sample from `k`
@@ -187,13 +242,16 @@ a noisy judge turns the whole thing into a coin-flip counter.
 - **No distributed coordination.** One run, one process, one log. Multi-agent
   runs would need per-agent logs plus a causal order across them — a real
   project, not an extension.
-- **No log compaction.** A day-long run's log is dominated by prompts, which is
-  why full prompt text is off by default (`store_prompts=False` keeps a hash
-  plus a tail). Compaction would mean rewriting the chain, which breaks
-  provenance; the honest version is a separate archival format.
-- **No automatic snapshot cadence tuning.** `k` is a cost/recovery-time knob
-  the operator sets. Auto-tuning it would need a cost model nobody has
-  calibrated yet.
+- **No log compaction.** Measured at ~2.6 KB/step, a 20k-step log is around
+  50 MiB, so compaction is not urgent — and it would mean rewriting the chain,
+  which breaks provenance. The honest version is a separate archival format.
+- **No automatic snapshot cadence tuning.** `k` is still the operator's to set.
+  What exists now is the arithmetic and a way to measure its inputs
+  (`ledger.cost`, `python -m ledger.bench`); making the runner adjust `k` at
+  runtime would mean estimating the crash rate `f` from data nobody has, and
+  the default `snapshot_every=5` is left alone deliberately — it is
+  conservative, which is the right way to be wrong when a tool's effects might
+  not be perfectly reproducible.
 - **No sandbox.** LEDGER records and replays what the agent does; it does not
   constrain it. Effect quarantine is a replay-safety mechanism, not a security
   boundary — a tool declared `PURE` that mails your customers will mail them.

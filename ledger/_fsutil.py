@@ -46,7 +46,10 @@ def clear_dir(root: Path, *, keep: set[str] = frozenset()) -> None:
     for child in root.iterdir():
         if child.name in keep:
             continue
-        if child.is_symlink() or child.is_file():
-            child.unlink()
-        else:
+        # Only real directories get rmtree. Everything else -- files, symlinks,
+        # fifos, and the character devices overlayfs uses as whiteouts -- is
+        # unlinked: opening a whiteout device to walk it fails with ENXIO.
+        if child.is_dir() and not child.is_symlink():
             shutil.rmtree(child)
+        else:
+            child.unlink()

@@ -96,7 +96,10 @@ python -m ledger --root .ledger show   <run_id>     # metadata + per-step summar
 python -m ledger --root .ledger timeline <run_id>   # the raw record stream
 python -m ledger --root .ledger verify <run_id>     # hash-chain integrity
 python -m ledger --root .ledger diff <run_a> <run_b>  # where two runs part ways
+python -m ledger --root .ledger profile <run_id>    # log size by record kind + projections
+python -m ledger --root .ledger cadence --steps 5000 --snapshot-ms 20 --effect-ms 0.02
 python -m ledger --root .ledger gc                  # drop unreferenced blobs
+python -m ledger.bench --steps 200 --seed-mb 20     # measure C_s and C_e for your workload
 ```
 
 ## The four decisions that make this more than plumbing
@@ -159,7 +162,13 @@ that crashed three times then replays as cleanly as one that never crashed.
   mid-run forking, and the effect-scope model that makes replay safe.
 - **Snapshot cost is real.** `DirSnapshotter` dedupes unchanged files by content,
   so hour 9 costs little more than hour 8 — but a Firecracker full snapshot
-  writes out guest RAM every time. Pick `k` accordingly.
+  writes out guest RAM every time. `python -m ledger.bench` measures `C_s` and
+  `C_e` for your workload and reports the optimal `k`; see *Picking k* below.
+- **Backends are verified unevenly.** The directory backend is exercised
+  throughout the suite and overlayfs has real mount-based tests (which found two
+  bugs). Firecracker is tested at the protocol level against a fake API socket —
+  route order, bodies, blob round-trip, resume-after-failure — but never against
+  a real hypervisor. Don't read a green suite as proof it boots a microVM.
 
 ## Forking is the primitive failure attribution needs
 
@@ -181,6 +190,33 @@ before the real culprit will appear to fix the run. The culprit is the **last**
 step whose resampling still clears the failure — which makes this a binary search
 over the step range, not a linear scan.
 
+## Picking k
+
+Recovery has two costs and only one responds to `k`:
+
+- **In-memory replay** re-runs the agent's code from step 1 to rebuild its
+  history. `k` does not change this at all. It is a floor.
+- **Effect re-execution** re-runs the internal tools above the snapshot's
+  `at_seq`. Only this scales with how stale the snapshot is.
+
+So `overhead(k) = (n/k)·C_s + f·(k/2)·C_e`, minimised near
+`k* = sqrt(2·n·C_s/(f·C_e))` — where `C_e` is the cost of re-executing *one
+step's internal effects*, not of replaying a step. Confusing the two is the easy
+mistake, and it recommends roughly twenty times too many snapshots on the
+workload measured in `docs/DESIGN.md`.
+
+The uncomfortable consequence: for an agent whose internal effects are cheap to
+redo, the replay floor (~4 ms/step measured) dwarfs `C_e` (~0.02 ms/step), and
+periodic snapshots buy almost nothing. They earn their keep when internal
+effects are *expensive* — a build, an install, a migration. The exception is
+correctness rather than speed: if internal effects are not reliably
+reproducible, `k` bounds how much irreproducibility a recovery is exposed to, so
+keep it small and ignore the optimum.
+
+```bash
+python -m ledger.bench --steps 200 --seed-mb 20 --k 5 10 25 50
+```
+
 ## Layout
 
 ```
@@ -190,6 +226,8 @@ ledger/effects.py      tool kinds, effect scopes, policies
 ledger/entropy.py      recorded clock, randomness, identity
 ledger/runner.py       the one loop that serves live, resume and fork
 ledger/attribution.py  resampling probes
+ledger/cost.py         log-volume profile + snapshot cadence model
+ledger/bench.py        python -m ledger.bench: measures C_s, C_e, log bytes/step
 ledger/timeline.py     step summaries, rendering, run-vs-run diffs
 ledger/cli.py          python -m ledger
 examples/demo_agent.py runnable crash / resume / fork / attribute walkthrough
@@ -197,5 +235,9 @@ docs/DESIGN.md         invariants, crash matrix, ordering rules, open problems
 ```
 
 ```bash
-pip install -e ".[dev]" && pytest      # 62 tests, including a real os._exit crash
+pip install -e ".[dev]" && pytest      # 85 tests, including a real os._exit crash,
+                                       # real overlayfs mounts, and a fake Firecracker API
 ```
+
+CI runs the suite on Python 3.10–3.13 plus the crash walkthrough and the
+benchmark. The overlayfs tests self-skip on hosted runners, which cannot mount.

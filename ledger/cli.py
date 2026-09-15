@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .cost import CadenceModel, LogProfile
 from .effects import EffectPolicy, ToolRegistry
 from .runner import AgentRunner
 from .store import RunStore
@@ -66,6 +67,19 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("run_id")
     p.add_argument("--kinds", help="comma-separated record kinds to keep")
     p.add_argument("--from-seq", type=int, default=1)
+
+    p = sub.add_parser("profile", help="log size breakdown and projections")
+    p.add_argument("run_id")
+    p.add_argument("--project", type=int, nargs="+", default=[1_000, 5_000, 20_000],
+                   help="run lengths to extrapolate to")
+
+    p = sub.add_parser("cadence", help="k* for measured constants (see python -m ledger.bench)")
+    p.add_argument("--steps", type=int, required=True)
+    p.add_argument("--snapshot-ms", type=float, required=True, help="C_s")
+    p.add_argument("--effect-ms", type=float, required=True,
+                   help="C_e: per-step cost of RE-EXECUTING internal effects, not of replay")
+    p.add_argument("--crashes", type=float, default=1.0)
+    p.add_argument("--k", type=int, nargs="*", default=[])
 
     p = sub.add_parser("diff", help="find where two runs diverge")
     p.add_argument("left")
@@ -125,6 +139,15 @@ def main(argv: list[str] | None = None) -> int:
         for depth, m in enumerate(store.lineage(args.run_id)):
             at = f" (forked after step {m.forked_at_step})" if m.parent_run_id else ""
             print(f"{'  ' * depth}{m.run_id}  {m.status}{at}")
+        return 0
+
+    if args.cmd == "profile":
+        print(LogProfile.from_log(store.log_path(args.run_id)).render(args.project))
+        return 0
+
+    if args.cmd == "cadence":
+        print(CadenceModel(args.steps, args.snapshot_ms / 1000, args.effect_ms / 1000,
+                           args.crashes).render(args.k))
         return 0
 
     if args.cmd == "diff":

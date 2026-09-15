@@ -38,6 +38,7 @@ Quick start::
 """
 
 from .attribution import ProbeResult, Trial, resample_probe, scan_steps
+from .cost import Cadence, CadenceModel, KindStat, LogProfile, recommend_k
 from .effects import (
     Divergence,
     EffectPolicy,
@@ -102,15 +103,17 @@ from .wal import (
 __version__ = "0.1.0"
 
 __all__ = [
-    "Agent", "AgentRunner", "CAS", "CallableModel", "Completion", "DirSnapshotter",
+    "Agent", "AgentRunner", "CAS", "Cadence", "CadenceModel", "CallableModel",
+    "Completion", "DirSnapshotter",
     "Divergence", "DivergenceError", "EffectPolicy", "EffectScope", "Entropy",
-    "FirecrackerSnapshotter", "GENESIS", "LogCorruption", "Mode", "ModelClient",
-    "OverlayFSSnapshotter", "ProbeResult", "Record", "RecordKind", "Recorder", "RunDiff",
+    "FirecrackerSnapshotter", "GENESIS", "KindStat", "LogCorruption", "LogProfile",
+    "Mode", "ModelClient",
+    "OverlayFSSnapshotter", "ProbeResult", "QuarantineError", "Record", "RecordKind", "Recorder", "RunDiff",
     "RunMeta", "RunOutcome", "RunStore", "ScriptedModel", "SnapshotError", "SnapshotRef",
     "SnapshotStore", "Snapshotter", "StepContext", "StepResult", "StepView",
     "StochasticModel", "Tape", "ToolError", "ToolKind", "ToolRegistry", "ToolRegistryError",
     "ToolSpec", "Trial", "Undecidable", "UndecidableEffect", "VerifyReport",
     "WriteAheadLog", "__version__", "abandoned_ranges", "boundary_seq", "canon",
     "diff_runs", "hash_text", "live_records", "load", "load_run", "new_run_id",
-    "render", "resample_probe", "scan_steps", "summarize", "verify",
+    "recommend_k", "render", "resample_probe", "scan_steps", "summarize", "verify",
 ]
