@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ledger-agent"
+version = "0.1.0"
+description = "Crash recovery and forking for day-long agent runs: a write-ahead log, environment snapshots, deterministic replay, and counterfactual branches."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = []
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[project.scripts]
+ledger = "ledger.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["ledger*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
