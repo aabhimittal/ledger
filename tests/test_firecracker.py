@@ -76,7 +76,10 @@ def fake_vm(tmp_path):
     server = _UnixHTTPServer(str(sock), _Handler)
     server.calls: list[tuple[str, str, dict]] = []
     server.fail_routes: set[str] = set()
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    # A short poll interval keeps shutdown() from waiting out the default 0.5 s,
+    # which the suite would otherwise pay once per test in teardown.
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.02},
+                              daemon=True)
     thread.start()
     try:
         yield server, FirecrackerSnapshotter(sock, tmp_path / "scratch"), CAS(tmp_path / "cas")
