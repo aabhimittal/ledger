@@ -29,6 +29,37 @@ jobs:
       - name: end-to-end crash / resume / fork walkthrough
         run: python examples/demo_agent.py demo --root "${RUNNER_TEMP}/ledger-demo"
 
+  firecracker:
+    # Verifies the snapshot payloads against the real Firecracker API parser.
+    # No KVM needed: Firecracker serves its API before it touches /dev/kvm, so a
+    # route/body mistake is caught here even though no guest boots. The
+    # full boot+restore test in the same file skips without KVM and images.
+    runs-on: ubuntu-latest
+    env:
+      FC_VERSION: v1.10.1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - name: fetch firecracker
+        run: |
+          set -euo pipefail
+          arch="$(uname -m)"
+          url="https://github.com/firecracker-microvm/firecracker/releases/download"
+          curl -fsSL "${url}/${FC_VERSION}/firecracker-${FC_VERSION}-${arch}.tgz" -o fc.tgz
+          tar xzf fc.tgz
+          mv "release-${FC_VERSION}-${arch}/firecracker-${FC_VERSION}-${arch}" ./firecracker
+          chmod +x ./firecracker
+          ./firecracker --version
+      - name: protocol tests against the real binary
+        env:
+          LEDGER_FIRECRACKER_BIN: ${{ github.workspace }}/firecracker
+        # -rs surfaces which tests skipped, so a silently-skipping job is visible
+        # rather than looking like a pass.
+        run: pytest tests/test_firecracker_live.py -v -rs
+
   cost-model:
     runs-on: ubuntu-latest
     steps:

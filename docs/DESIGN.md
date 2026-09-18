@@ -180,12 +180,20 @@ here:
   re-merged) and `clear_dir` crashed with ENXIO trying to `rmtree` a whiteout
   device. They skip where the kernel or privileges will not allow a mount, so a
   green CI run on a hosted runner has *not* tested this backend.
-- `FirecrackerSnapshotter` — `tests/test_firecracker.py` drives it against a
-  fake API socket: route order, request bodies, CAS round-trip of the state and
-  memory files, scratch cleanup, and that a failed create still resumes the VM.
-  That is the protocol, which is the part most likely to be wrong. It is not
-  proof that a real Firecracker accepts those bodies, and should not be read as
-  such.
+- `FirecrackerSnapshotter` — two layers. `tests/test_firecracker.py` drives a
+  fake API socket (route order, bodies, CAS round-trip, scratch cleanup, and
+  that a failed create still resumes the VM). `tests/test_firecracker_live.py`
+  then puts those same payloads to the **real binary**, which is possible
+  without KVM because Firecracker serves its API before it touches
+  `/dev/kvm`. Its three rejection modes are distinguishable — unknown route
+  (`Invalid request method and/or path`), bad body (`deserializing the json
+  body`), and route-and-body-accepted-but-wrong-lifecycle (`not supported
+  before starting the microVM`) — so "the payload reached a *semantic* error"
+  is a positive result. A negative control asserts that a deliberately wrong
+  body really is rejected, which stops the whole thing passing vacuously.
+  This catches the failure the fake never could: the API drifting. What is
+  still unverified is a *booted* guest; the full boot/snapshot/restore test
+  exists and skips without `/dev/kvm` and guest images.
 
 ## What it costs
 
@@ -198,8 +206,14 @@ workspace, ~2 KB prompts, `DirSnapshotter`) — illustrative, not a default:
 | log volume, default | ~2.6 KB/step | prompt hash + tail; ~13 MiB at 5k steps |
 | log volume, `store_prompts=True` | ~4.4 KB/step | 1.7× at this prompt length; ~21 MiB at 5k steps |
 | `C_s` snapshot capture | ~20 ms | 20 MiB workspace; 41 snapshots deduped to 560 KiB of CAS |
-| `C_e` effect re-execution | ~0.02 ms/step | one 80-byte file append |
+| `C_e`, cheap effect | ~0.02 ms/step | one 80-byte file append (`--workload append`) |
+| `C_e`, expensive effect | ~27 ms/step | write 512 KiB, re-digest accumulated state (`--workload rebuild`) |
 | in-memory replay floor | ~4 ms/step | 170 steps replayed in 0.72 s |
+
+`C_e` spans **three orders of magnitude** between those two workloads, and `k*`
+at n=5000 moves from ~3000 (snapshot almost never) to ~100 with it. That is the
+whole argument for measuring rather than reasoning, and it is why no default
+value of `k` can be right for everyone.
 
 Two conclusions, and the second is uncomfortable:
 
@@ -208,14 +222,35 @@ costs 1.7× here and grows with prompt length. A 20k-step run is tens of
 megabytes either way, so log size is not what will stop you — which is why the
 default keeps a hash plus a tail rather than doing anything cleverer.
 
-**Recovery time is dominated by the one cost `k` cannot reduce.** The in-memory
-replay floor was ~200× `C_e` per step in this calibration. For a workload whose
-internal effects are this cheap to redo, periodic snapshots buy almost nothing:
-`k*` comes out at "just the baseline and the terminal snapshot", and the naive
-model — the one that feeds *total* per-step replay time into the formula —
-recommends about twenty times more snapshots than are worth taking. Snapshots
-earn their keep when internal effects are expensive (a build, an install, a
-database write), not merely when a run is long.
+**Recovery time is dominated by the one cost `k` cannot reduce — until effects
+get expensive.** With the cheap effect the in-memory floor was ~200× `C_e` per
+step, so periodic snapshots bought almost nothing and `k*` came out at "just the
+baseline and the terminal snapshot". With the expensive effect `C_e` (27 ms)
+exceeded the floor (4 ms) and `k*` dropped to ~100. Snapshots earn their keep
+when internal effects are expensive (a build, an install, a migration), not
+merely when a run is long.
+
+The naive model — feeding *total* per-step replay time into the formula — is
+wrong in **both** directions, which is worth knowing because the error does not
+announce itself. With cheap effects it overstates `C_e` and recommends ~20×
+too many snapshots; with expensive effects the same total is spread across every
+replayed step, so it understates `C_e` and snapshots too rarely (179 vs 100 at
+n=5000). A test pins both directions.
+
+### Estimating `f`
+
+The crash rate was the last assumed constant, and it does not have to be:
+`estimate_crash_rate(store)` counts it from the store's own history. Every
+recovery leaves a `resume` note in the log, and a resume only happens after a
+crash, so crashes-per-run is a count over exposure — Poisson, with Byar's
+closed-form interval (no SciPy). Forks are excluded: a fork is a deliberate
+branch, not a run that had to be rescued.
+
+The reassuring part is that `f` barely matters. Since `k* ∝ f^(-1/2)`, a *550×*
+interval on the crash rate — which is what one crash in one run honestly gives
+you — becomes less than a 25× spread in `k*`, and the overhead curve near the
+optimum is flatter still. Not knowing `f` is a weak reason to ignore the model.
+Note the mapping inverts: the *high* crash rate gives the *small* `k`.
 
 With one important exception, which the cost model deliberately does not cover:
 if a tool's internal effects are **not** reliably reproducible, `k` stops being a
@@ -223,6 +258,50 @@ performance parameter and becomes a correctness one. Replay re-executes every
 internal effect above the snapshot line, so `k` bounds how much
 irreproducibility a recovery is exposed to. Where that is a worry, pick `k`
 small and ignore the optimum.
+
+## Several agents
+
+The earlier note here called multi-agent "a project, not an extension". That was
+half wrong, and the half that was wrong is the interesting half: **another agent
+is part of the outside world.** An agent that reads what a peer wrote has
+observed something outside its own snapshot, which is what `EXTERNAL` scope
+already means — so each agent stays independently replayable using rules that
+already existed. The replay machinery needed no changes at all.
+
+What genuinely was missing:
+
+- **Causal order across logs.** Per-agent sequence numbers cannot say whether A's
+  step 7 preceded B's step 3. Lamport clocks stamped on cross-agent events can,
+  and `merge_timeline` builds one joint history from them. The clocks are never
+  persisted and do not need to be: a clock's value is a function of the
+  coordination events the agent saw, and replay serves those from its own log —
+  the same reason its message history needs no checkpoint schema.
+- **Coordination that replays.** `send_message` (IRREVERSIBLE + EXTERNAL, so a
+  replay never delivers twice), `receive_messages` (PURE + EXTERNAL — nothing is
+  mutated, but the *answer* depends on peers, so it must be served from the log),
+  and `claim_resource` (IDEMPOTENT + EXTERNAL, check-and-set under a file lock).
+  `receive_messages` is the case that justifies having two axes at all: pure and
+  yet unsafe to re-run.
+- **Deterministic contention.** Because the claim outcome is recorded and
+  EXTERNAL, a *lost race replays as lost* — even if the resource is free by the
+  time recovery runs. Without that, a resumed loser could win the second time and
+  two agents would believe they hold the same resource.
+- **Consistent cuts.** Forking one agent leaves its peers on the unforked
+  timeline, so a naive per-agent fork point can describe a history that never
+  happened: an agent holding a message nobody sent. `consistent_cut` retracts cut
+  points until that cannot happen (the Chandy–Lamport condition), cascading when
+  one retraction orphans a further message.
+
+One constraint is not optional: **each agent needs its own snapshotted
+workspace.** Restoring a snapshot rolls back a whole directory, so two agents
+sharing one would find that recovering either undoes the other's work. Shared
+mutable state must live outside every agent's snapshot and be reached through
+EXTERNAL tools. That follows from what a snapshot *is*, so no amount of
+coordination machinery removes it.
+
+The coordination log is for coordination, not bulk data: every append
+re-validates the hash chain under an exclusive lock. Right for the hundreds of
+events a run produces, wrong for millions.
 
 ## Attribution is monotone, not step-local
 
@@ -239,9 +318,9 @@ a noisy judge turns the whole thing into a coin-flip counter.
 
 ## Deliberate omissions
 
-- **No distributed coordination.** One run, one process, one log. Multi-agent
-  runs would need per-agent logs plus a causal order across them — a real
-  project, not an extension.
+- **Cross-machine agents.** `ledger/multi.py` now covers several agents in one
+  store on one machine (see below). Spanning machines means agreeing on the
+  coordination log, which is consensus — and *that* estimate stands.
 - **No log compaction.** Measured at ~2.6 KB/step, a 20k-step log is around
   50 MiB, so compaction is not urgent — and it would mean rewriting the chain,
   which breaks provenance. The honest version is a separate archival format.
