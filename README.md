@@ -98,8 +98,11 @@ python -m ledger --root .ledger verify <run_id>     # hash-chain integrity
 python -m ledger --root .ledger diff <run_a> <run_b>  # where two runs part ways
 python -m ledger --root .ledger profile <run_id>    # log size by record kind + projections
 python -m ledger --root .ledger cadence --steps 5000 --snapshot-ms 20 --effect-ms 0.02
+python -m ledger --root .ledger crashrate --steps 5000  # estimate f from your own history
+python -m ledger --root .ledger timeline-joint <run_a> <run_b>   # causal order across agents
 python -m ledger --root .ledger gc                  # drop unreferenced blobs
 python -m ledger.bench --steps 200 --seed-mb 20     # measure C_s and C_e for your workload
+python -m ledger.bench --workload rebuild           # ...with an expensive internal effect
 ```
 
 ## The four decisions that make this more than plumbing
@@ -164,11 +167,13 @@ that crashed three times then replays as cleanly as one that never crashed.
   so hour 9 costs little more than hour 8 — but a Firecracker full snapshot
   writes out guest RAM every time. `python -m ledger.bench` measures `C_s` and
   `C_e` for your workload and reports the optimal `k`; see *Picking k* below.
-- **Backends are verified unevenly.** The directory backend is exercised
-  throughout the suite and overlayfs has real mount-based tests (which found two
-  bugs). Firecracker is tested at the protocol level against a fake API socket —
-  route order, bodies, blob round-trip, resume-after-failure — but never against
-  a real hypervisor. Don't read a green suite as proof it boots a microVM.
+- **Backends are verified unevenly, and the docs say how far each goes.** The
+  directory backend is exercised throughout the suite; overlayfs has real
+  mount-based tests (which found two bugs); Firecracker's payloads are checked
+  against the **real binary's** API parser, which works without KVM because
+  Firecracker serves its API before it touches `/dev/kvm`. What remains
+  unverified is a *booted* guest — that test exists and skips without `/dev/kvm`
+  and guest images. A green suite is not proof it boots a microVM.
 
 ## Forking is the primitive failure attribution needs
 
@@ -205,17 +210,64 @@ step's internal effects*, not of replaying a step. Confusing the two is the easy
 mistake, and it recommends roughly twenty times too many snapshots on the
 workload measured in `docs/DESIGN.md`.
 
-The uncomfortable consequence: for an agent whose internal effects are cheap to
-redo, the replay floor (~4 ms/step measured) dwarfs `C_e` (~0.02 ms/step), and
-periodic snapshots buy almost nothing. They earn their keep when internal
-effects are *expensive* — a build, an install, a migration. The exception is
-correctness rather than speed: if internal effects are not reliably
-reproducible, `k` bounds how much irreproducibility a recovery is exposed to, so
-keep it small and ignore the optimum.
+Measured across two workloads, `C_e` spans three orders of magnitude, and `k*`
+moves with it:
+
+| internal effect per step | `C_e` | `k*` at n=5000 |
+|---|---|---|
+| append 80 bytes | 0.02 ms | ~3000 (barely snapshot) |
+| write 512 KiB + re-digest state | 27 ms | ~100 |
+
+So for cheap effects the replay floor (~4 ms/step) dwarfs `C_e` and periodic
+snapshots buy almost nothing; for expensive ones they pay for themselves. No
+shipped default can be right for both, which is why there's a benchmark instead
+of a recommendation. The naive estimator errs in *both* directions — see
+`docs/DESIGN.md`.
+
+`f`, the crash rate, is estimated from your store's own history rather than
+assumed (`ledger crashrate`): every recovery leaves a `resume` note, so
+crashes-per-run is a Poisson count with a closed-form interval. And it matters
+less than it looks — since `k* ∝ f^(-1/2)`, a 550× interval on `f` is under a 25×
+spread in `k*`.
+
+The exception to all of this is correctness rather than speed: if internal effects
+are not reliably reproducible, `k` bounds how much irreproducibility a recovery is
+exposed to, so keep it small and ignore the optimum.
 
 ```bash
 python -m ledger.bench --steps 200 --seed-mb 20 --k 5 10 25 50
+python -m ledger.bench --workload rebuild --effect-kb 512
 ```
+
+## Several agents
+
+`ledger/multi.py` runs several agents against one store, on the strength of one
+observation: **another agent is part of the outside world.** Reading what a peer
+wrote is an observation from outside your own snapshot, which is what `EXTERNAL`
+scope already means — so every agent stays independently replayable and the replay
+machinery needed no changes.
+
+```python
+from ledger.multi import Coordinator, LamportClock, register_coordination, send, receive
+
+coord = Coordinator("./.ledger")
+register_coordination(tools, coord, agent="planner", clock=LamportClock())
+
+def step(self, ctx):
+    send(ctx, "builder", {"task": "compile"})     # never re-delivered on replay
+    for msg in receive(ctx):                       # served from the log on replay
+        ...
+    if ctx.call("claim_resource", resource="deploy-slot")["won"]:
+        ...                                        # a lost race replays as lost
+```
+
+What that buys, beyond messaging: Lamport clocks give a causal order across logs
+(`merge_timeline`), a contended claim replays with the **same winner**, and
+`consistent_cut` retracts fork points that would leave an agent holding a message
+nobody sent (Chandy–Lamport). One constraint is not optional — each agent needs
+its own snapshotted workspace, because restoring a snapshot rolls back a whole
+directory and would undo a co-tenant's work. Cross-machine agents are still out
+of scope: that needs consensus on the coordination log.
 
 ## Layout
 
@@ -226,8 +278,9 @@ ledger/effects.py      tool kinds, effect scopes, policies
 ledger/entropy.py      recorded clock, randomness, identity
 ledger/runner.py       the one loop that serves live, resume and fork
 ledger/attribution.py  resampling probes
-ledger/cost.py         log-volume profile + snapshot cadence model
+ledger/cost.py         log-volume profile, cadence model, crash-rate estimation
 ledger/bench.py        python -m ledger.bench: measures C_s, C_e, log bytes/step
+ledger/multi.py        several agents: Lamport order, coordination, consistent cuts
 ledger/timeline.py     step summaries, rendering, run-vs-run diffs
 ledger/cli.py          python -m ledger
 examples/demo_agent.py runnable crash / resume / fork / attribute walkthrough
@@ -235,9 +288,12 @@ docs/DESIGN.md         invariants, crash matrix, ordering rules, open problems
 ```
 
 ```bash
-pip install -e ".[dev]" && pytest      # 85 tests, including a real os._exit crash,
-                                       # real overlayfs mounts, and a fake Firecracker API
+pip install -e ".[dev]" && pytest      # 105 tests: a real os._exit crash, real
+                                       # overlayfs mounts, the real Firecracker
+                                       # binary, and multi-agent contention
 ```
 
-CI runs the suite on Python 3.10–3.13 plus the crash walkthrough and the
-benchmark. The overlayfs tests self-skip on hosted runners, which cannot mount.
+CI runs the suite on Python 3.10–3.13, the crash walkthrough, the benchmark, and
+the Firecracker protocol tests against a downloaded release binary. Tests that
+need privileges self-skip and say so (`-rs`): the overlayfs mounts skip on hosted
+runners, and the full microVM boot skips without `/dev/kvm` plus guest images.

@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .cost import CadenceModel, LogProfile
+from .cost import CadenceModel, LogProfile, estimate_crash_rate, k_range_for_rate
 from .effects import EffectPolicy, ToolRegistry
 from .runner import AgentRunner
 from .store import RunStore
@@ -80,6 +80,15 @@ def main(argv: list[str] | None = None) -> int:
                    help="C_e: per-step cost of RE-EXECUTING internal effects, not of replay")
     p.add_argument("--crashes", type=float, default=1.0)
     p.add_argument("--k", type=int, nargs="*", default=[])
+
+    p = sub.add_parser("crashrate", help="estimate f from this store's own history")
+    p.add_argument("--steps", type=int, help="also show the k* range this implies")
+    p.add_argument("--snapshot-ms", type=float, default=20.0)
+    p.add_argument("--effect-ms", type=float, default=0.02)
+    p.add_argument("--include-forks", action="store_true")
+
+    p = sub.add_parser("timeline-joint", help="one causal timeline across several runs")
+    p.add_argument("run_id", nargs="+")
 
     p = sub.add_parser("diff", help="find where two runs diverge")
     p.add_argument("left")
@@ -148,6 +157,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "cadence":
         print(CadenceModel(args.steps, args.snapshot_ms / 1000, args.effect_ms / 1000,
                            args.crashes).render(args.k))
+        return 0
+
+    if args.cmd == "crashrate":
+        rate = estimate_crash_rate(store, include_forks=args.include_forks)
+        print(rate)
+        if args.steps and rate.observed:
+            lo, mid, hi = k_range_for_rate(args.steps, args.snapshot_ms / 1000,
+                                           args.effect_ms / 1000, rate)
+            print(f"k* at n={args.steps}: {mid} (range {lo}-{hi} across the CI)")
+            print("  k* scales as f^-1/2, so even a wide interval on f moves k* "
+                  "little -- note the\n  mapping inverts: the high crash rate "
+                  "gives the small k.")
+        return 0
+
+    if args.cmd == "timeline-joint":
+        from .multi import merge_timeline
+        for event in merge_timeline(store, args.run_id):
+            print(event)
         return 0
 
     if args.cmd == "diff":

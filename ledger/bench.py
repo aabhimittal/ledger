@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import hashlib
 import shutil
 import statistics
 import time
@@ -66,10 +67,12 @@ class ChurnAgent:
     dedupe-friendly -- the shape of a real long run.
     """
 
-    def __init__(self, steps: int, files: int, prompt_chars: int):
+    def __init__(self, steps: int, files: int, prompt_chars: int,
+                 effect: str = "append_chunk"):
         self.steps = steps
         self.files = files
         self.prompt_chars = prompt_chars
+        self.effect = effect
         self.history: list[str] = []
 
     def step(self, ctx: StepContext) -> StepResult | None:
@@ -77,13 +80,23 @@ class ChurnAgent:
         pad = "c" * max(0, self.prompt_chars - len(context) - 40)
         text = ctx.sample(f"draft step {ctx.step}\ncontext: {context}\n{pad}").text
         self.history.append(text[:24])
-        ctx.call("append_chunk", slot=ctx.step % self.files, text=text[:80])
+        ctx.call(self.effect, slot=ctx.step % self.files, text=text[:80])
         if ctx.step >= self.steps:
             return ctx.done(len(self.history))
         return None
 
 
-def _tools() -> ToolRegistry:
+def _tools(workload: str = "append", effect_kb: int = 256) -> ToolRegistry:
+    """Two INTERNAL tools spanning the range of C_e that actually matters.
+
+    ``append`` is the cheap end: an 80-byte write, microseconds. ``rebuild`` is
+    the expensive end -- write a chunk, then re-digest everything written so far,
+    the way a build or a test suite redoes work proportional to accumulated
+    state. Both return a value that is deterministic given the restored
+    workspace, which is what lets replay re-execute them and verify the result;
+    ``rebuild``'s digest covers the whole workspace, so it doubles as a check
+    that the snapshot boundary was honoured exactly.
+    """
     tools = ToolRegistry()
 
     def append_chunk(slot: int, text: str, workspace: Path) -> int:
@@ -92,8 +105,17 @@ def _tools() -> ToolRegistry:
             f.write(text + "\n")
         return target.stat().st_size
 
+    def rebuild(slot: int, text: str, workspace: Path) -> str:
+        target = workspace / f"build-{slot:04d}.bin"
+        target.write_bytes((text * 64).encode()[:effect_kb * 1024].ljust(effect_kb * 1024, b"."))
+        digest = hashlib.sha256()
+        for part in sorted(workspace.glob("build-*.bin")):
+            digest.update(part.read_bytes())
+        return digest.hexdigest()
+
     tools.register("append_chunk", append_chunk, kind=ToolKind.PURE,
                    scope=EffectScope.INTERNAL)
+    tools.register("rebuild", rebuild, kind=ToolKind.PURE, scope=EffectScope.INTERNAL)
     return tools
 
 
@@ -141,6 +163,7 @@ class BenchReport:
     files: int
     prompt_chars: int
     seed_mb: float
+    workload: str
     snapshot_seconds: float
     effect_replay_seconds_per_step: float
     differential_effect_seconds_per_step: float
@@ -161,7 +184,8 @@ class BenchReport:
 
 
 def _run_once(root: Path, *, k: int, steps: int, files: int, prompt_chars: int,
-              store_prompts: bool, crash_fraction: float, seed_mb: float) -> RunSample:
+              store_prompts: bool, crash_fraction: float, seed_mb: float,
+              workload: str = "append", effect_kb: int = 256) -> RunSample:
     """One live run, then a crash at ``crash_fraction`` and a timed resume."""
     if root.exists():
         shutil.rmtree(root)
@@ -169,8 +193,11 @@ def _run_once(root: Path, *, k: int, steps: int, files: int, prompt_chars: int,
     _seed(workspace, seed_mb)
     store = RunStore(root / "store")
     runner = AgentRunner(
-        agent_factory=lambda: ChurnAgent(steps, files, prompt_chars),
-        store=store, workspace=workspace, model=PaddedModel(), tools=_tools(),
+        agent_factory=lambda: ChurnAgent(
+            steps, files, prompt_chars,
+            effect="rebuild" if workload == "rebuild" else "append_chunk"),
+        store=store, workspace=workspace, model=PaddedModel(),
+        tools=_tools(workload, effect_kb),
         snapshot_every=k, max_steps=steps + 5, store_prompts=store_prompts,
         sync="batch",
     )
@@ -227,10 +254,12 @@ def _elapsed(fn) -> float:
 
 def measure(root: Path, *, steps: int = 120, files: int = 30, prompt_chars: int = 2_000,
             ks: list[int] | None = None, crashes: float = 1.0,
-            crash_fraction: float = 0.85, seed_mb: float = 0.0) -> BenchReport:
+            crash_fraction: float = 0.85, seed_mb: float = 0.0,
+            workload: str = "append", effect_kb: int = 256) -> BenchReport:
     ks = ks or [5, 10, 25]
     common = dict(steps=steps, files=files, prompt_chars=prompt_chars,
-                  crash_fraction=crash_fraction, seed_mb=seed_mb)
+                  crash_fraction=crash_fraction, seed_mb=seed_mb,
+                  workload=workload, effect_kb=effect_kb)
 
     samples = [_run_once(root / f"k{k}", k=k, store_prompts=False, **common) for k in ks]
 
@@ -263,7 +292,7 @@ def measure(root: Path, *, steps: int = 120, files: int = 30, prompt_chars: int 
     lengths = (steps, 1_000, 5_000, 20_000)
     return BenchReport(
         steps=steps, files=files, prompt_chars=prompt_chars, seed_mb=seed_mb,
-        snapshot_seconds=c_s, effect_replay_seconds_per_step=c_e,
+        workload=workload, snapshot_seconds=c_s, effect_replay_seconds_per_step=c_e,
         differential_effect_seconds_per_step=differential_c_e,
         fixed_replay_seconds=fixed,
         optimal_k={str(n): CadenceModel(n, c_s, c_e, crashes).optimal_k for n in lengths},
@@ -282,7 +311,8 @@ def measure(root: Path, *, steps: int = 120, files: int = 30, prompt_chars: int 
 
 def render(report: BenchReport, ks: list[int], crashes: float) -> str:
     out = [f"workload: {report.steps} steps, {report.files} churned files, "
-           f"~{report.prompt_chars} char prompts, {report.seed_mb:g} MiB seeded workspace",
+           f"~{report.prompt_chars} char prompts, {report.seed_mb:g} MiB seeded "
+           f"workspace, internal effect = {report.workload!r}",
            "", "LOG VOLUME", report.profile_text]
     for mode, bps in report.log_bytes_per_step.items():
         proj = report.projections[mode]
@@ -330,6 +360,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--steps", type=int, default=120)
     ap.add_argument("--files", type=int, default=30)
     ap.add_argument("--prompt-chars", type=int, default=2_000)
+    ap.add_argument("--workload", choices=["append", "rebuild"], default="append",
+                    help="internal effect per step: a cheap append, or an expensive "
+                         "rebuild that re-digests accumulated state")
+    ap.add_argument("--effect-kb", type=int, default=256,
+                    help="bytes written per rebuild step")
     ap.add_argument("--seed-mb", type=float, default=0.0,
                     help="pre-populate the workspace with this many MiB")
     ap.add_argument("--k", type=int, nargs="+", default=[5, 10, 25])
@@ -345,7 +380,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         report = measure(root, steps=args.steps, files=args.files,
                          prompt_chars=args.prompt_chars, ks=args.k,
-                         crashes=args.crashes, seed_mb=args.seed_mb)
+                         crashes=args.crashes, seed_mb=args.seed_mb,
+                         workload=args.workload, effect_kb=args.effect_kb)
         print(json.dumps(report.to_dict(), indent=2) if args.json
               else render(report, args.k, args.crashes))
     finally:

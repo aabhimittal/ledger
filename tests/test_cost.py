@@ -85,17 +85,24 @@ def test_free_effects_mean_no_periodic_snapshots():
                        effect_replay_seconds_per_step=0.01, crashes=0.0) == 500
 
 
-def test_using_total_replay_time_understates_k():
+def test_using_total_replay_time_errs_in_both_directions():
     """The mistake the benchmark caught, pinned so it cannot creep back.
 
-    In-memory replay is k-independent; feeding it to the model as if k could
-    reduce it recommends far more snapshots than are worth taking.
+    In-memory replay is k-independent, so feeding total per-step replay time to
+    the model is wrong -- and which way it is wrong depends on which cost
+    dominates the resume. Both regimes are measured in docs/DESIGN.md.
     """
-    honest = recommend_k(5_000, snapshot_seconds=0.02,
-                         effect_replay_seconds_per_step=0.00002)
-    naive = recommend_k(5_000, snapshot_seconds=0.02,
-                        effect_replay_seconds_per_step=0.0006)
-    assert naive < honest / 4
+    # Cheap effects: the floor dominates the resume, so the naive figure
+    # overstates C_e and buys snapshots that save nothing.
+    honest_cheap = recommend_k(5_000, 0.02, 0.00002)      # C_e = 0.02 ms
+    naive_cheap = recommend_k(5_000, 0.02, 0.0006)        # total/step = 0.6 ms
+    assert naive_cheap < honest_cheap / 4
+
+    # Expensive effects: effect replay is most of the resume but is amortised
+    # over every replayed step, so the naive figure understates C_e instead.
+    honest_dear = recommend_k(5_000, 0.029, 0.027)        # C_e = 27 ms
+    naive_dear = recommend_k(5_000, 0.029, 0.009)         # total/step = 9 ms
+    assert naive_dear > honest_dear * 1.5
 
 
 # -- the measurement the model consumes ------------------------------------
@@ -123,3 +130,66 @@ def test_a_fresh_snapshot_leaves_no_effects_to_replay(tmp_path):
 
     assert resumed.replayed_steps == 4       # the floor: still replays every step
     assert resumed.replayed_effects == 0     # but re-executes nothing
+
+
+# -- estimating f ----------------------------------------------------------
+def test_crash_rate_counts_resumes_not_forks(tmp_path):
+    """Every recovery leaves a resume note; a fork is a choice, not a rescue."""
+    from ledger.cost import estimate_crash_rate
+
+    h = build(tmp_path)
+    out = h.runner.start()
+    assert estimate_crash_rate(h.store).crashes == 0     # finished cleanly
+
+    crash_at(h.store, out.run_id,
+             seq_of(records_of(h.store, out.run_id), RecordKind.STEP_END, step=3))
+    h.runner.resume(out.run_id)
+    # after_step=4 keeps the report inside the replayed prefix, so the branch
+    # does not trip the outbound quarantine.
+    h.runner.fork(out.run_id, after_step=4, workspace=tmp_path / "branch")
+
+    rate = estimate_crash_rate(h.store)
+    assert (rate.runs, rate.crashes) == (1, 1)           # the fork is excluded
+    assert rate.rate == 1.0
+    assert estimate_crash_rate(h.store, include_forks=True).runs == 2
+    assert "crashes/run" in str(rate)
+
+
+def test_crash_rate_interval_brackets_the_estimate(tmp_path):
+    from ledger.cost import estimate_crash_rate
+
+    h = build(tmp_path)
+    for _ in range(3):
+        h.runner.start()
+
+    rate = estimate_crash_rate(h.store)
+    assert rate.runs == 3 and rate.crashes == 0
+    assert rate.rate == 0.0
+    # Zero observed crashes does not mean a zero rate: the interval stays open
+    # upwards, which is the honest reading of three quiet runs.
+    assert rate.lo == 0.0 and rate.hi > 0.0
+
+
+def test_no_history_says_so_rather_than_guessing(tmp_path):
+    from ledger.cost import estimate_crash_rate
+    from ledger import RunStore
+
+    rate = estimate_crash_rate(RunStore(tmp_path / "empty"))
+    assert not rate.observed
+    assert "cannot be estimated" in str(rate)
+
+
+def test_k_star_is_insensitive_to_a_wide_interval_on_f(tmp_path):
+    """The practical answer to "we don't know f": it barely matters.
+
+    k* scales as f^(-1/2), so a 100x uncertainty in the crash rate is only a 10x
+    spread in k* -- and the total overhead near the optimum is flatter still.
+    """
+    from ledger.cost import CrashRate, k_range_for_rate
+
+    wide = CrashRate(runs=1, crashes=1, lo=0.01, hi=5.5)
+    small_k, mid_k, large_k = k_range_for_rate(5_000, 0.02, 0.00002, wide)
+
+    assert small_k < mid_k < large_k          # high f -> small k, and vice versa
+    assert (wide.hi / wide.lo) > 100
+    assert (large_k / small_k) < 25           # 550x in f becomes <25x in k

@@ -38,7 +38,16 @@ Quick start::
 """
 
 from .attribution import ProbeResult, Trial, resample_probe, scan_steps
-from .cost import Cadence, CadenceModel, KindStat, LogProfile, recommend_k
+from .cost import (
+    Cadence,
+    CadenceModel,
+    CrashRate,
+    KindStat,
+    LogProfile,
+    estimate_crash_rate,
+    k_range_for_rate,
+    recommend_k,
+)
 from .effects import (
     Divergence,
     EffectPolicy,
@@ -53,6 +62,18 @@ from .effects import (
     UndecidableEffect,
 )
 from .entropy import Entropy
+from .multi import (
+    Coordinator,
+    CoordKind,
+    Cut,
+    JointEvent,
+    LamportClock,
+    consistent_cut,
+    merge_timeline,
+    receive,
+    register_coordination,
+    send,
+)
 from .model import CallableModel, Completion, ModelClient, ScriptedModel, StochasticModel
 from .runner import (
     Agent,
@@ -104,9 +125,10 @@ __version__ = "0.1.0"
 
 __all__ = [
     "Agent", "AgentRunner", "CAS", "Cadence", "CadenceModel", "CallableModel",
-    "Completion", "DirSnapshotter",
+    "Completion", "CoordKind", "Coordinator", "CrashRate", "Cut", "DirSnapshotter",
     "Divergence", "DivergenceError", "EffectPolicy", "EffectScope", "Entropy",
-    "FirecrackerSnapshotter", "GENESIS", "KindStat", "LogCorruption", "LogProfile",
+    "FirecrackerSnapshotter", "GENESIS", "JointEvent", "KindStat", "LamportClock",
+    "LogCorruption", "LogProfile",
     "Mode", "ModelClient",
     "OverlayFSSnapshotter", "ProbeResult", "QuarantineError", "Record", "RecordKind", "Recorder", "RunDiff",
     "RunMeta", "RunOutcome", "RunStore", "ScriptedModel", "SnapshotError", "SnapshotRef",
@@ -114,6 +136,8 @@ __all__ = [
     "StochasticModel", "Tape", "ToolError", "ToolKind", "ToolRegistry", "ToolRegistryError",
     "ToolSpec", "Trial", "Undecidable", "UndecidableEffect", "VerifyReport",
     "WriteAheadLog", "__version__", "abandoned_ranges", "boundary_seq", "canon",
-    "diff_runs", "hash_text", "live_records", "load", "load_run", "new_run_id",
+    "consistent_cut", "diff_runs", "estimate_crash_rate", "hash_text",
+    "k_range_for_rate", "live_records", "load", "load_run", "merge_timeline",
+    "new_run_id", "receive", "register_coordination", "send",
     "recommend_k", "render", "resample_probe", "scan_steps", "summarize", "verify",
 ]

@@ -32,10 +32,14 @@ Differentiating gives
     k* = sqrt(2 * n * C_s / (f * C_e))
 
 Using the *whole* per-step replay time in place of ``C_e`` is the tempting
-mistake: it inflates a cost ``k`` cannot reduce and drives ``k`` far lower than
-it needs to be, buying snapshots that save nothing. ``C_e`` is usually the much
-smaller number -- a file append versus a whole agent step -- so honest ``k*``
-values are large.
+mistake, and it errs in **both** directions depending on which cost dominates the
+resume. When internal effects are cheap (a file append) the total is mostly the
+in-memory floor, so the naive figure overstates ``C_e`` and buys snapshots that
+save nothing. When internal effects are expensive (a rebuild) the total is spread
+over every replayed step, so it *understates* ``C_e`` and snapshots too rarely.
+Measured on one machine, ``C_e`` spans 0.02 ms to 27 ms across those two
+workloads -- three orders of magnitude -- which is why it has to be measured
+rather than reasoned about.
 
 ``k*`` grows as sqrt(n): a run ten times longer wants a window only about three
 times wider. And ``C_s`` and ``C_e`` are properties of a workload and a machine,
@@ -48,7 +52,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
 from .wal import Record, RecordKind, load
 
@@ -221,6 +225,92 @@ def recommend_k(steps: int, snapshot_seconds: float, effect_replay_seconds_per_s
     """``k*`` for a run of ``steps`` with these measured constants."""
     return CadenceModel(steps, snapshot_seconds, effect_replay_seconds_per_step,
                         crashes).optimal_k
+
+
+# --------------------------------------------------------------------------
+# estimating f, the crash rate
+# --------------------------------------------------------------------------
+@dataclass
+class CrashRate:
+    """``f`` estimated from a store's own history rather than assumed.
+
+    Crashes per run is a count over exposure, so the natural model is Poisson.
+    The interval is Byar's approximation to the exact Poisson interval -- closed
+    form, accurate down to small counts, and it needs no SciPy.
+    """
+
+    runs: int
+    crashes: int
+    lo: float
+    hi: float
+    """Approximate 95% interval on the rate."""
+
+    @property
+    def rate(self) -> float:
+        return self.crashes / self.runs if self.runs else 0.0
+
+    @property
+    def observed(self) -> bool:
+        return self.runs > 0
+
+    def __str__(self) -> str:
+        if not self.observed:
+            return "no runs recorded: f cannot be estimated, assume a value"
+        return (f"f = {self.rate:.3f} crashes/run "
+                f"(95% CI {self.lo:.3f}-{self.hi:.3f}, from {self.crashes} crashes "
+                f"over {self.runs} runs)")
+
+
+def _byar(count: int, exposure: float, z: float = 1.959964) -> tuple[float, float]:
+    if exposure <= 0:
+        return 0.0, 0.0
+    lo = 0.0
+    if count > 0:
+        lo = count * (1 - 1 / (9 * count) - z / (3 * math.sqrt(count))) ** 3
+    hi = (count + 1) * (1 - 1 / (9 * (count + 1)) + z / (3 * math.sqrt(count + 1))) ** 3
+    return max(0.0, lo / exposure), hi / exposure
+
+
+def estimate_crash_rate(store: Any, *, include_forks: bool = False) -> CrashRate:
+    """Count crashes per run from the logs a store already holds.
+
+    Every recovery leaves evidence in the log: a ``resume`` note, and an
+    ``abandon`` record when the crash landed mid-step. Counting resume notes
+    counts crashes, because a resume only happens after one.
+
+    Forks are excluded by default: a fork is a deliberate branch, not a run that
+    someone had to rescue, and counting them would inflate ``f``.
+    """
+    from .wal import RecordKind, load  # local import: cost.py stays dependency-free
+
+    runs = crashes = 0
+    for meta in store.list_runs():
+        if not include_forks and meta.parent_run_id:
+            continue
+        runs += 1
+        records = load(store.log_path(meta.run_id)).records
+        crashes += sum(1 for r in records if r.kind == RecordKind.NOTE
+                       and r.payload.get("event") == "resume")
+    lo, hi = _byar(crashes, runs)
+    return CrashRate(runs=runs, crashes=crashes, lo=lo, hi=hi)
+
+
+def k_range_for_rate(steps: int, snapshot_seconds: float,
+                     effect_replay_seconds_per_step: float,
+                     rate: CrashRate) -> tuple[int, int, int]:
+    """``k*`` at the low, point and high ends of an estimated crash rate.
+
+    Worth computing before agonising over ``f``: since ``k* ∝ f^(-1/2)``, being
+    wrong about the crash rate by 10x moves ``k*`` by only ~3x, and the total
+    overhead near the optimum is flatter still. An uncertain ``f`` is a weak
+    excuse for not using the model -- but note the mapping is inverted, so the
+    *high* crash rate gives the *small* k.
+    """
+    def k_at(f: float) -> int:
+        return CadenceModel(steps, snapshot_seconds, effect_replay_seconds_per_step,
+                            max(f, 1e-9)).optimal_k
+
+    return k_at(rate.hi), k_at(rate.rate if rate.rate > 0 else rate.hi), k_at(max(rate.lo, 1e-9))
 
 
 def _human(nbytes: float) -> str:
